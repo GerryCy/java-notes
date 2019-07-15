@@ -28,7 +28,7 @@
   - [ReadWriteLock原理](#ReadWriteLock原理)
 - [StampedLock](#StampedLock使用)
   - [StampedLock使用](#StampedLock使用)
-  - [StampedLock原理](#StampedLock)
+  - [StampedLock原理](#StampedLock原理)
 - [Condition](#condition)
   - [Condition使用](#Condition使用)
   - [Condition原理](#Condition)
@@ -424,15 +424,191 @@ public class TestFieldUpdater {
 
 ### AQS概述
 
-
+​	AbstractQueuedSynchronizer抽象队列同步器简称AQS，它是实现同步器的基础组件，juc下面Lock的实现以及一些并发工具类就是通过AQS来实现的，这里我们通过AQS的类图先看一下大概，下面我们总结一下AQS的实现原理。先看看AQS的类图
 
 ![aqs-class](../../assert/aqs-class.png)
+
+​	**(1)**AQS是一个通过内置的**FIFO**双向队列来完成线程的排队工作(内部通过结点head和tail记录队首和队尾元素，元素的结点类型为Node类型，后面我们会看到Node的具体构造)。
+
+​	**(2)**其中**Node**中的thread用来存放进入AQS队列中的线程引用，Node结点内部的SHARED表示标记线程是因为获取共享资源失败被阻塞添加到队列中的；Node中的EXCLUSIVE表示线程因为获取独占资源失败被阻塞添加到队列中的。waitStatus表示当前线程的等待状态：
+
+​	①CANCELLED=1：表示线程因为中断或者等待超时，需要从等待队列中取消等待；
+
+​	②SIGNAL=-1：当前线程thread1占有锁，队列中的head(仅仅代表头结点，里面没有存放线程引用)的后继结点node1处于等待状态，如果已占有锁的线程thread1释放锁或被CANCEL之后就会通知这个结点node1去获取锁执行。
+
+​	③CONDITION=-2：表示结点在等待队列中(这里指的是等待在某个lock的condition上，关于Condition的原理下面会写到)，当持有锁的线程调用了Condition的signal()方法之后，结点会从该condition的等待队列转移到该lock的同步队列上，去竞争lock。(注意：这里的同步队列就是我们说的AQS维护的FIFO队列，等待队列则是每个condition关联的队列)
+
+​	④PROPAGTE=-3：表示下一次共享状态获取将会传递给后继结点获取这个共享同步状态。
+
+​	**(3)**AQS中维持了一个单一的volatile修饰的状态信息state(AQS通过Unsafe的相关方法，以原子性的方式由线程去获取这个state)。AQS提供了getState()、setState()、compareAndSetState()函数修改值(实际上调用的是unsafe的compareAndSwapInt方法)。
+
+​	**(4)**AQS的设计师基于**模板方法**模式的。使用时候需要继承同步器并重写指定的方法，并且通常将子类推荐为定义同步组件的静态内部类，子类重写这些方法之后，AQS工作时使用的是提供的模板方法，在这些模板方法中调用子类重写的方法。
+
+​	**(5)**AQS的内部类**ConditionObject**是通过结合锁实现线程同步，ConditionObject可以直接访问AQS的变量(state、queue)，ConditionObject是个条件变量 ，每个ConditionObject对应一个队列用来存放线程调用condition条件变量的await方法之后被阻塞的线程。
+
+
 
 #### AQS中的Node结点
 
 ### AQS中的条件变量
 
 ### 自定义实现同步组件
+
+```java
+package lock;
+
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.AbstractQueuedSynchronizer;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+
+public class NonReentrantLock implements Lock {
+
+    //使用静态内部类继承AQS，并重写指定的方法
+    private static class Sync extends AbstractQueuedSynchronizer {
+        @Override
+        protected boolean tryAcquire(int arg) {
+            //使用CAS尝试去设置同步状态
+            if (compareAndSetState(0, 1)) {
+                //如果获取成功，设置state占有者为当前线程
+                setExclusiveOwnerThread(Thread.currentThread());
+                return true;
+            }
+            return false;
+        }
+
+        //释放
+        @Override
+        protected boolean tryRelease(int arg) {
+            if (getState() == 0) {
+                throw new IllegalMonitorStateException();
+            }
+            setExclusiveOwnerThread(null);
+            setState(0);
+            return true;
+        }
+
+        //是否处于占有状态
+        @Override
+        protected boolean isHeldExclusively() {
+            return getState() == 1;
+        }
+
+        //提供条件变量接口
+        Condition newCondition() {
+            return new ConditionObject();
+        }
+    }
+
+    //创建一个Sync来做具体的同步工作
+    private final Sync sync = new Sync();
+    @Override
+    public void lock() {
+        sync.acquire(1); //这里调用的是AQS的模板方法，而在其中又调用了sync实现的tryAcquire方法
+    }
+
+    @Override
+    public void lockInterruptibly() throws InterruptedException {
+        sync.acquireInterruptibly(1);
+    }
+
+    @Override
+    public boolean tryLock() {
+        return sync.tryAcquire(1);
+    }
+
+    @Override
+    public boolean tryLock(long time, TimeUnit unit) throws InterruptedException {
+        return sync.tryAcquireNanos(1,unit.toNanos(time));
+    }
+
+    @Override
+    public void unlock() {
+        sync.release(1);
+    }
+
+    @Override
+    public Condition newCondition() {
+        return sync.newCondition();
+    }
+
+    public boolean isLocked() {
+        return sync.isHeldExclusively();
+    }
+}
+//使用自定义同步组建实现Producer-Consumer-Model
+package lock;
+
+import java.util.Queue;
+import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.locks.Condition;
+
+public class ProduceAndConsumer {
+
+    private static final NonReentrantLock lock = new NonReentrantLock();
+    private static final Condition notFull = lock.newCondition();
+    private static final Condition notEmpty = lock.newCondition();
+
+    private static Queue<String> queue = new LinkedBlockingQueue<>();
+    private final static int SIZE = 10;
+
+    public static void main(String[] args) {
+        new Thread("ProducerThread") {
+            @Override
+            public void run() {
+                while (true) {
+                    lock.lock();
+                    try {
+                        //生产者线程
+                        //队列满了，等待
+                        while (queue.size() == SIZE) {
+                            System.out.println("size : " + queue.size());
+                            notEmpty.await();
+                        }
+                        //队列未满，添加元素
+                        queue.add("element");
+                        //唤醒消费者线程
+                        notFull.signalAll();
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    } finally {
+                        lock.unlock();
+                    }
+                }
+            }
+        }.start();
+
+        new Thread("ConsumerThread") {
+            @Override
+            public void run() {
+                while (true) {
+                    lock.lock();
+                    try {
+                        //消费者线程
+                        //队列空了，等待
+                        while (queue.size() == 0) {
+                            notFull.await();
+                        }
+                        //队列未满，添加元素
+                        String ele = queue.poll();
+                        System.out.println(ele);
+                        //唤醒生产者者线程
+                        notEmpty.signalAll();
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    } finally {
+                        lock.unlock();
+                    }
+                }
+            }
+        }.start();
+    }
+}
+
+```
+
+
 
 ## ReentrantLock
 
@@ -463,6 +639,8 @@ public class TestFieldUpdater {
 ### CountDownLatch使用
 
 ### CountDownLatch原理
+
+![countdownlatch-class](../../assert/countdownlatch-class.png)
 
 ## CylicBarrier
 
