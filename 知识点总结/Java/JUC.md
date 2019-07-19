@@ -12,6 +12,8 @@
 - [Unsafe类](#unsafe类)
 - [AQS](#AQS)
   - [AQS概述](#AQS概述)
+  - [AQS中的独占模式](#AQS中的独占模式)
+  - [AQS中的共享模式](#AQS中的共享模式)
   - [AQS中的条件变量](#AQS中的条件变量)
   - [自定义实现同步组件](#自定义实现同步组件)
 - [CountDownLatch](#countdownlatch)
@@ -422,9 +424,9 @@ public class TestFieldUpdater {
 
 ## AQS
 
-### AQS概述
+### AQS概述  
 
-​	AbstractQueuedSynchronizer抽象队列同步器简称AQS，它是实现同步器的基础组件，juc下面Lock的实现以及一些并发工具类就是通过AQS来实现的，这里我们通过AQS的类图先看一下大概，下面我们总结一下AQS的实现原理。先看看AQS的类图
+​	AbstractQueuedSynchronizer抽象队列同步器简称AQS，它是实现同步器的基础组件，juc下面Lock的实现以及一些并发工具类就是通过AQS来实现的，这里我们通过AQS的类图先看一下大概，下面我们总结一下AQS的实现原理。先看看AQS的类图。[Java中的队列同步器AQS](https://www.cnblogs.com/fsmly/p/10701109.html)
 
 ![aqs-class](../../assert/aqs-class.png)
 
@@ -440,15 +442,137 @@ public class TestFieldUpdater {
 
 ​	④PROPAGTE=-3：表示下一次共享状态获取将会传递给后继结点获取这个共享同步状态。
 
-​	**(3)**AQS中维持了一个单一的volatile修饰的状态信息state(AQS通过Unsafe的相关方法，以原子性的方式由线程去获取这个state)。AQS提供了getState()、setState()、compareAndSetState()函数修改值(实际上调用的是unsafe的compareAndSwapInt方法)。
+下面是Node内部类的源码
+
+```java
+    static final class Node {
+        /**共享模式下获取state失败被构造为Node结点加入同步队列中 */
+        static final Node SHARED = new Node();
+        /**独占模式下获取state失败被构造为node节点加入同步队列 */
+        static final Node EXCLUSIVE = null;
+        /**同步队列中等待的线程被取消，节点进入该状态不会发生变化*/
+        static final int CANCELLED =  1;
+        /**唤醒后继节点*/
+        static final int SIGNAL    = -1;
+        /**表示节点中的线程阻塞在某个condition上*/
+        static final int CONDITION = -2;
+        /**表示下一次共享状态获取将会传递给后继结点获取这个共享同步状态。*/
+        static final int PROPAGATE = -3;
+        /**waitStatus取值就是上面的四种情况*/
+        volatile int waitStatus;
+        /**当前Node节点的前去结点*/
+        volatile Node prev;
+        /**Node节点的后继节点*/
+        volatile Node next;
+        /** 当前Node节点中的线程引用*/
+        volatile Thread thread;
+        /** condition队列中的后继结点，如果当前节点是共享的，那么这个字段是一个SHARED常量 ，也就是当前节点类
+        型和等待队列中的后继节点共用一个字段*/
+        Node nextWaiter;
+        /**返回当前是否是共享式的节点类型*/
+        final boolean isShared() {
+            return nextWaiter == SHARED;
+        }
+        /** 假设多个线程取竞争state的时候
+        (1)初始情况下队列是没有结点的，这时候如果出现竞争情况，那么势必就有一个线程将会被构造为Node结点添加到
+        队列中，在这个过程中，首先会做的是(实际上AQS的模板方法acquire中的第二步就是将CAS设置同步失败的线程构
+        造为相应模式的Node加入同步队列中),为队列添加一个head结点（在enq方法中自旋直到设置head成功并将自己添
+        加作为head的后继结点）
+        (2)上面是初始情况下同步队列中没有node结点的情况，如果已经同步队列中已经有node结点，那么后续的线程竞争
+        失败的话就是直接将自己设置为tail结点(具体的做法就是获得当前队列的tail结点，将之设置为自己的prev结点)
+        (3)上面构造同步队列的以及添加新的node的过程都是以CAS的方式进行的
+         */
+        final Node predecessor() throws NullPointerException {
+            Node p = prev;
+            if (p == null)
+                throw new NullPointerException();
+            else
+                return p;
+        }
+	    //初始同步队列为空的(head=tail= null)的时候，这时要添加新的node结点就会在enq方法中添加一个空的head
+        //结点，这个结点中不保存任何线程的引用或者等待状态信息，保存这个state的队首head(没有包含线程引用)和队尾tail(包含线程引用)
+        Node() {    // 用于建立初始头或SHARED标记
+        }
+	    //竞争失败的线程被构造为Node结点的时候，调用的构造方法
+        Node(Thread thread, Node mode) {
+            this.nextWaiter = mode;
+            this.thread = thread;
+        }
+	    //condition队队列
+        Node(Thread thread, int waitStatus) {
+            this.waitStatus = waitStatus;
+            this.thread = thread;
+        }
+    }
+```
+
+​	**(3)**AQS中维持了一个单一的volatile修饰的状态信息state(AQS通过Unsafe的相关方法，以原子性的方式由线程去获取这个state)。AQS提供了getState()、setState()、compareAndSetState()函数修改值(实际上调用的是unsafe的compareAndSwapInt方法)。下面是AQS中的部分成员变量以及更新state的方法
+
+```java
+//这就是我们刚刚说到的head结点，懒加载的（只有竞争失败需要构建同步队列的时候，才会创建这个head），如果头节点存在，它的waitStatus不能为CANCELLED
+private transient volatile Node head;
+//当前同步队列尾节点的引用，也是懒加载的，只有调用enq方法的时候会添加一个新的wait node
+private transient volatile Node tail;
+//AQS核心：同步状态
+private volatile int state;
+protected final int getState() {
+    return state;
+}
+protected final void setState(int newState) {
+    state = newState;
+}
+protected final boolean compareAndSetState(int expect, int update) {
+    return unsafe.compareAndSwapInt(this, stateOffset, expect, update);
+}
+```
 
 ​	**(4)**AQS的设计师基于**模板方法**模式的。使用时候需要继承同步器并重写指定的方法，并且通常将子类推荐为定义同步组件的静态内部类，子类重写这些方法之后，AQS工作时使用的是提供的模板方法，在这些模板方法中调用子类重写的方法。
 
-​	**(5)**AQS的内部类**ConditionObject**是通过结合锁实现线程同步，ConditionObject可以直接访问AQS的变量(state、queue)，ConditionObject是个条件变量 ，每个ConditionObject对应一个队列用来存放线程调用condition条件变量的await方法之后被阻塞的线程。
+​	子类可以重写的方法：
+
+```java
+//独占式的获取同步状态，实现该方法需要查询当前状态并判断同步状态是否符合预期，然后再进行CAS设置同步状态
+protected boolean tryAcquire(int arg) {	throw new UnsupportedOperationException();}
+//独占式的释放同步状态，等待获取同步状态的线程可以有机会获取同步状态
+protected boolean tryRelease(int arg) {	throw new UnsupportedOperationException();}
+//共享式的获取同步状态
+protected int tryAcquireShared(int arg) { throw new UnsupportedOperationException();}
+//尝试将状态设置为以共享模式释放同步状态。 该方法总是由执行释放的线程调用。 
+protected int tryReleaseShared(int arg) { throw new UnsupportedOperationException(); }
+//当前同步器是否在独占模式下被线程占用，一般该方法表示是否被当前线程所独占
+protected int isHeldExclusively(int arg) {	throw new UnsupportedOperationException();}
+```
+
+​	AQS提供的模板方法，这些方法会调用具体子类实现的方法，后面会单独说独占模式和共享模式下这些方法的执行原理。
+
+```java
+//以独占模式获取，忽略中断
+public final void acquire(int arg) {...}
+//以独占方式获得，如果中断，中止。
+public final void acquireInterruptibly(int arg) throws InterruptedException {...}
+//尝试以独占模式获取，如果中断则中止，如果给定的超时时间失败
+public final boolean tryAcquireNanos(int arg, long nanosTimeout) throws InterruptedException {...}
+//以共享模式获取，忽略中断。 
+public final void acquireShared(int arg){...}
+//以共享方式获取，如果中断，中止
+public final void acquireSharedInterruptibly(int arg) throws InterruptedException{...}
+//尝试以共享模式获取，如果中断则中止，如果给定的时间超过，则失败。
+public final boolean tryAcquireSharedNanos(int arg, long nanosTimeout) throws InterruptedException{...}
+//独占式的释放同步状态，该方法会在释放同步状态之后，将同步队列中的第一个节点包含的线程唤醒
+public final boolean release(int arg){...}
+//共享式的释放同步状态
+public final boolean releaseShared(int arg){...}
+//获取在等待队列上的线程集合
+public final Collection<Thread> getQueuedThreads(){...}
+```
+
+​	**(5)**AQS的内部类**ConditionObject**是通过结合锁实现线程同步，ConditionObject可以直接访问AQS的变量(state、queue)，ConditionObject是个条件变量 ，每个ConditionObject对应一个队列用来存放线程调用condition条件变量的await方法之后被阻塞的线程。后面会单独说到
+
+### AQS中的独占模式
 
 
 
-#### AQS中的Node结点
+### AQS中的共享模式
 
 ### AQS中的条件变量
 
@@ -641,6 +765,38 @@ public class ProduceAndConsumer {
 ### CountDownLatch原理
 
 ![countdownlatch-class](../../assert/countdownlatch-class.png)
+
+```java
+private static final class Sync extends AbstractQueuedSynchronizer {
+    private static final long serialVersionUID = 4982264981922014374L;
+
+    Sync(int count) {
+        setState(count);
+    }
+
+    int getCount() {
+        return getState();
+    }
+
+    protected int tryAcquireShared(int acquires) {
+        return (getState() == 0) ? 1 : -1;
+    }
+
+    protected boolean tryReleaseShared(int releases) {
+        // Decrement count; signal when transition to zero
+        for (;;) {
+            int c = getState();
+            if (c == 0)
+                return false;
+            int nextc = c-1;
+            if (compareAndSetState(c, nextc))
+                return nextc == 0;
+        }
+    }
+}
+```
+
+
 
 ## CylicBarrier
 
