@@ -570,6 +570,240 @@ public final Collection<Thread> getQueuedThreads(){...}
 
 ### AQS中的独占模式
 
+​	上面我们简单了解了一下AQS的基本组成，这里通过**ReentrantLock**的**非公平锁**实现来具体分析AQS的独占模式的加锁和释放锁的过程。
+
+#### 非公平锁的加锁流程
+
+​	简单说来，AQS会把所有的请求线程构成一个CLH队列，当一个线程执行完毕（lock.unlock()）时会激活自己的后继节点，但正在执行的线程并不在队列中，而那些等待执行的线程全部处于阻塞状态(park())。如下图所示。
+
+![CLH](../../assert/CLH.png)
+
+​	**(1)**假设这个时候在初始情况下，还没有多任务来请求竞争这个state，这时候如果第一个线程thread1调用了lock方法请求获得锁，首先会通过CAS的方式将state更新为1，表示自己thread1获得了锁，并将独占锁的线程持有者设置为thread1。
+
+```java
+final void lock() {
+    if (compareAndSetState(0, 1))
+        //setExclusiveOwnerThread是AbstractOwnableSynchronizer的方法，AQS继承了AbstractOwnableSynchronizer
+        setExclusiveOwnerThread(Thread.currentThread());
+    else
+        acquire(1);
+}
+```
+
+​	**(2)**这个时候有另一个线程thread2来尝试或者锁，同样也调用lock方法，尝试通过CAS的方式将state更新为1，但是由于之前已经有线程持有了state，所以thread2这一步CAS失败（前面的thread1已经获取state并且没有释放），就会调用acquire(1)方法（该方法是AQS提供的模板方法，它会调用子类的tryAcquire方法）。非公平锁的实现中，AQS的模板方法acquire(1)就会调用NofairSync的tryAcquire方法，而tryAcquire方法又调用的Sync的nonfairTryAcquire方法，所以我们看看nonfairTryAcquire的流程。
+
+```java
+//NofairSync
+protected final boolean tryAcquire(int acquires) {
+    return nonfairTryAcquire(acquires);
+}
+final boolean nonfairTryAcquire(int acquires) {
+    //（1）获取当前线程
+    final Thread current = Thread.currentThread();
+    //（2）获得当前同步状态state
+    int c = getState();
+    //（3）如果state==0，表示没有线程获取
+    if (c == 0) {
+        //（3-1）那么就尝试以CAS的方式更新state的值
+        if (compareAndSetState(0, acquires)) {
+            //（3-2）如果更新成功，就设置当前独占模式下同步状态的持有者为当前线程
+            setExclusiveOwnerThread(current);
+            //（3-3）获得成功之后，返回true
+            return true;
+        }
+    }
+    //（4）这里是重入锁的逻辑
+    else if (current == getExclusiveOwnerThread()) {
+        //（4-1）判断当前占有state的线程就是当前来再次获取state的线程之后，就计算重入后的state
+        int nextc = c + acquires;
+        //（4-2）这里是风险处理
+        if (nextc < 0) // overflow
+            throw new Error("Maximum lock count exceeded");
+        //（4-3）通过setState无条件的设置state的值，（因为这里也只有一个线程操作state的值，即
+        //已经获取到的线程，所以没有进行CAS操作）
+        setState(nextc);
+        return true;
+    }
+    //（5）没有获得state，也不是重入，就返回false
+    return false;
+}
+```
+
+总结来说就是：
+
+1、获取当前将要去获取锁的线程thread2。
+
+2、获取当前AQS的state的值。如果此时state的值是0，那么我们就通过CAS操作获取锁，然后设置AQS的线程占有者为thread2。很明显，在当前的这个执行情况下，state的值是1不是0，因为我们的thread1还没有释放锁。所以CAS失败，后面第3步的重入逻辑也不会进行
+
+3、如果当前将要去获取锁的线程等于此时AQS的exclusiveOwnerThread的线程，则此时将state的值加1，这是重入锁的实现方式。
+
+4、最终thread2执行到这里会返回false。
+
+​	**(3)**上面的thread2加锁失败，返回false。那么根据开始我们讲到的AQS概述就应该将thread2构造为一个Node结点加入同步队列中。因为NofairSync的tryAcquire方法是由AQS的模板方法acquire()来调用的，那么我们看看该方法的源码以及执行流程。
+
+```java
+//(1)tryAcquire，这里thread2执行返回了false，那么就会执行addWaiter将当前线程构造为一个结点加入同步队列中
+public final void acquire(int arg) {
+    if (!tryAcquire(arg) &&
+        acquireQueued(addWaiter(Node.EXCLUSIVE), arg))
+        selfInterrupt();
+}
+```
+
+​	那么我们就看一下addWaiter方法的执行流程。
+
+```java
+private Node addWaiter(Node mode) {
+    //(1)将当前线程以及阻塞原因(是因为SHARED模式获取state失败还是EXCLUSIVE获取失败)构造为Node结点
+    Node node = new Node(Thread.currentThread(), mode);
+    //(2)这一步是快速将当前线程插入队列尾部
+    Node pred = tail;
+    if (pred != null) {
+        //(2-1)将构造后的node结点的前驱结点设置为tail
+        node.prev = pred;
+        //(2-2)以CAS的方式设置当前的node结点为tail结点
+        if (compareAndSetTail(pred, node)) {
+            //(2-3)CAS设置成功，就将原来的tail的next结点设置为当前的node结点。这样这个双向队
+            //列就更新完成了
+            pred.next = node;
+            return node;
+        }
+    }
+    //(3)执行到这里，说明要么当前队列为null，要么存在多个线程竞争失败都去将自己设置为tail结点，
+    //那么就会有线程在上面（2-2）的CAS设置中失败，就会到这里调用enq方法
+    enq(node);
+    return node;
+}
+```
+
+​	那么总结一下add Waiter方法
+
+​	1、将当前将要去获取锁的线程也就是thread2和独占模式封装为一个node对象。
+
+​	2、尝试快速的将当前线程构造的node结点添加作为tail结点(这里就是直接获取当前tail，然后将node的前驱结点设置为tail)，并且以CAS的方式将node设置为tail结点(CAS成功后将原tail的next设置为node，然后这个队列更新成功)。
+
+​	3、如果2设置失败，就进入enq方法。
+
+​	在刚刚的thread1和thread2的环境下，开始时候线程阻塞队列是空的(因为thread1获取了锁，thread2也是刚刚来请求锁，所以线程阻塞队列里面是空的)。很明显，这个时候队列的尾部tail节点也是null，那么将直接进入到enq方法。所以我们看看enq方法的实现
+
+```java
+private Node enq(final Node node) {
+    for (;;) {
+        //(4)还是先获取当前队列的tail结点
+        Node t = tail;
+        //(5)如果tail为null，表示当前同步队列为null，就必须初始化这个同步队列的head和tail（建
+        //立一个哨兵结点）
+        if (t == null) { 
+            //（5-1）初始情况下，多个线程竞争失败，在检查的时候都发现没有哨兵结点，所以需要CAS的
+            //设置哨兵结点
+            if (compareAndSetHead(new Node()))
+                tail = head;
+        } 
+        //(6)tail不为null
+        else {
+            //(6-1)直接将当前结点的前驱结点设置为tail结点
+            node.prev = t;
+            //(6-2)前驱结点设置完毕之后，还需要以CAS的方式将自己设置为tail结点，如果设置失败，
+            //就会重新进入循环判断一遍
+            if (compareAndSetTail(t, node)) {
+                t.next = node;
+                return t;
+            }
+        }
+    }
+}
+```
+
+​	enq方法内部是一个自旋循环，第一次循环默认情况如下图所示
+
+​	1、首先代码块（4）处将t指向了tail，判断得到t==null，如图(1)所示；
+
+​	2、于是需要新建一个哨兵结点作为整个同步队列的头节点(代码块5-1处执行)
+
+​	3、完了之后如图(2)所示。这样第一次循环执行完毕。
+
+![enq-for-one](../../assert/enq-for-one.png)
+
+​	第二次循环整体执行如下图所示。
+
+​	1、还是先获取当前tail结点然后将t指向tail结点。如下图的(3)
+
+​	2、然后判断得到当前t!=null，所以enq方法中进入代码块(6).
+
+​	3、在(6-1)代码块中将node的前驱结点设置为原来队列的tail结点，如下图的(4)所示。
+
+​	4、设置完前驱结点之后，代码块(6-2)会以CAS的方式将当前的node结点设置为tail结点,如果设置成功，就会是下图(5)所示。更新完tail结点之后，需要保证双向队列的，所以将原来的指向哨兵结点的t的next结点指向node结点，如下图(6)所示。最后返回。
+
+![enq-for-two](../../assert/enq-for-two.png)
+
+​	总结来说，即使在多线程情况下，enq方法还是能够保证每个线程结点会被安全的添加到同步队列中，因为enq通过CAS方式将结点添加到同步队列之后才会返回，否则就会不断尝试添加(这样实际上就是在并发情况下，把向同步队列添加Node变得串行化了)
+
+​	**(4)**在上面AQS的模板方法中，acquire()方法还有一步acquireQueued，这个方法的主要作用就是在同步队列中嗅探到自己的前驱结点，如果前驱结点是头节点的话就会尝试取获取同步状态，否则会先设置自己的waitStatus为-1，然后调用LockSupport的方法park自己。具体的实现如下面代码所示
+
+```java
+final boolean acquireQueued(final Node node, int arg) {
+    boolean failed = true;
+    try {
+        boolean interrupted = false;
+        //在这样一个循环中尝试tryAcquire同步状态
+        for (;;) {
+            //获取前驱结点
+            final Node p = node.predecessor();
+            //(1)如果前驱结点是头节点，就尝试取获取同步状态，这里的tryAcquire方法相当于还是调
+            //用NofairSync的tryAcquire方法，在上面已经说过
+            if (p == head && tryAcquire(arg)) {
+                //如果前驱结点是头节点并且tryAcquire返回true，那么就重新设置头节点为node
+                setHead(node);
+                p.next = null; //将原来的头节点的next设置为null，交由GC去回收它
+                failed = false;
+                return interrupted;
+            }
+            //(2)如果不是头节点,或者虽然前驱结点是头节点但是尝试获取同步状态失败就会将node结点
+            //的waitStatus设置为-1(SIGNAL),并且park自己，等待前驱结点的唤醒。至于唤醒的细节
+            //下面会说到
+            if (shouldParkAfterFailedAcquire(p, node) &&
+                parkAndCheckInterrupt())
+                interrupted = true;
+        }
+    } finally {
+        if (failed)
+            cancelAcquire(node);
+    }
+}
+```
+
+​	在上面的代码中我们可以看出，这个方法也是一个自旋循环，继续按照刚刚的thread1和thread2这个情况分析。在enq方法执行完之后，同步队列的情况大概如下所示。
+
+![queue1](../../assert/queue1.png)
+
+​	当前的node结点的前驱结点为head，所以会调用tryAcquire()方法去获得同步状态。但是由于state被thread1占有，所以tryAcquire失败。这里就是执行acquireQueued方法的代码块(2)了。代码块(2)中首先调用了shouldParkAfterFailedAcquire方法，该方法会将同步队列中node结点的前驱结点的waitStatus为CANCELLED的线程移除，并将当前调用该方法的线程所属结点自己和他的前驱结点的waitStatus设置为-1(SIGNAL)，然后返回。具体方法实现如下所示
+
+```java
+private static boolean shouldParkAfterFailedAcquire(Node pred, Node node) {
+    //（1）获取前驱结点的waitStatus
+    int ws = pred.waitStatus;
+    //（2）如果前驱结点的waitStatus为SINGNAL，就直接返回true
+    if (ws == Node.SIGNAL)
+        //前驱结点的状态为SIGNAL，那么该结点就能够安全的调用park方法阻塞自己了。
+        return true;
+    if (ws > 0) {
+        //（3）这里就是将所有的前驱结点状态为CANCELLED的都移除。
+        do {
+            node.prev = pred = pred.prev;
+        } while (pred.waitStatus > 0);
+        pred.next = node;
+    } else {
+        /*
+             * waitStatus must be 0 or PROPAGATE.  Indicate that we
+             * need a signal, but don't park yet.  Caller will need to
+             * retry to make sure it cannot acquire before parking.
+             */
+        compareAndSetWaitStatus(pred, ws, Node.SIGNAL);
+    }
+    return false;
+}
+```
+
 
 
 ### AQS中的共享模式
@@ -579,15 +813,7 @@ public final Collection<Thread> getQueuedThreads(){...}
 ### 自定义实现同步组件
 
 ```java
-package lock;
-
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.AbstractQueuedSynchronizer;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.Lock;
-
 public class NonReentrantLock implements Lock {
-
     //使用静态内部类继承AQS，并重写指定的方法
     private static class Sync extends AbstractQueuedSynchronizer {
         @Override
@@ -661,13 +887,6 @@ public class NonReentrantLock implements Lock {
     }
 }
 //使用自定义同步组建实现Producer-Consumer-Model
-package lock;
-
-import java.util.Queue;
-import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.locks.Condition;
-
 public class ProduceAndConsumer {
 
     private static final NonReentrantLock lock = new NonReentrantLock();
@@ -739,6 +958,10 @@ public class ProduceAndConsumer {
 ### ReentrantLock使用
 
 ### ReentrantLock原理
+
+![ReentrantLock](../../assert/ReentrantLock.png)
+
+非公平锁的实现原理请参考上面介绍AQS原理的[非公平锁的加锁流程](#非公平锁的加锁流程).
 
 ## ReadWriteLock
 
