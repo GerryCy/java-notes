@@ -432,6 +432,14 @@ public class TestFieldUpdater {
 
 ​	**(1)**AQS是一个通过内置的**FIFO**双向队列来完成线程的排队工作(内部通过结点head和tail记录队首和队尾元素，元素的结点类型为Node类型，后面我们会看到Node的具体构造)。
 
+```java
+/*等待队列的队首结点(懒加载，这里体现为竞争失败的情况下，加入同步队列的线程执行到enq方法的时候会创
+建一个Head结点)。该结点只能被setHead方法修改。并且结点的waitStatus不能为CANCELLED*/
+private transient volatile Node head;
+/**等待队列的尾节点，也是懒加载的。（enq方法）。只在加入新的阻塞结点的情况下修改*/
+private transient volatile Node tail;
+```
+
 ​	**(2)**其中**Node**中的thread用来存放进入AQS队列中的线程引用，Node结点内部的SHARED表示标记线程是因为获取共享资源失败被阻塞添加到队列中的；Node中的EXCLUSIVE表示线程因为获取独占资源失败被阻塞添加到队列中的。waitStatus表示当前线程的等待状态：
 
 ​	①CANCELLED=1：表示线程因为中断或者等待超时，需要从等待队列中取消等待；
@@ -787,12 +795,13 @@ private static boolean shouldParkAfterFailedAcquire(Node pred, Node node) {
         //前驱结点的状态为SIGNAL，那么该结点就能够安全的调用park方法阻塞自己了。
         return true;
     if (ws > 0) {
-        //（3）这里就是将所有的前驱结点状态为CANCELLED的都移除。
+        //（3）这里就是将所有的前驱结点状态为CANCELLED的都移除
         do {
             node.prev = pred = pred.prev;
         } while (pred.waitStatus > 0);
         pred.next = node;
     } else {
+        
         /*
              * waitStatus must be 0 or PROPAGATE.  Indicate that we
              * need a signal, but don't park yet.  Caller will need to
