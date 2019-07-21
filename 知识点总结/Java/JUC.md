@@ -784,7 +784,7 @@ final boolean acquireQueued(final Node node, int arg) {
 
 ![queue1](../../assert/queue1.png)
 
-​	当前的node结点的前驱结点为head，所以会调用tryAcquire()方法去获得同步状态。但是由于state被thread1占有，所以tryAcquire失败。这里就是执行acquireQueued方法的代码块(2)了。代码块(2)中首先调用了shouldParkAfterFailedAcquire方法，该方法会将同步队列中node结点的前驱结点的waitStatus为CANCELLED的线程移除，并将当前调用该方法的线程所属结点自己和他的前驱结点的waitStatus设置为-1(SIGNAL)，然后返回。具体方法实现如下所示
+​	当前的node结点的前驱结点为head，所以会调用tryAcquire()方法去获得同步状态。但是由于state被thread1占有，所以tryAcquire失败。这里就是执行acquireQueued方法的代码块(2)了。代码块(2)中首先调用了shouldParkAfterFailedAcquire方法，该方法会将同步队列中node结点的前驱结点的waitStatus为CANCELLED的线程移除，并将当前调用该方法的线程所属结点自己和他的前驱结点的waitStatus设置为-1(SIGNAL)，然后返回。具体方法实现如下所示。
 
 ```java
 private static boolean shouldParkAfterFailedAcquire(Node pred, Node node) {
@@ -801,21 +801,232 @@ private static boolean shouldParkAfterFailedAcquire(Node pred, Node node) {
         } while (pred.waitStatus > 0);
         pred.next = node;
     } else {
-        
-        /*
-             * waitStatus must be 0 or PROPAGATE.  Indicate that we
-             * need a signal, but don't park yet.  Caller will need to
-             * retry to make sure it cannot acquire before parking.
-             */
+        //CAS操作将这个前驱节点设置成SIGHNAL。
         compareAndSetWaitStatus(pred, ws, Node.SIGNAL);
     }
     return false;
 }
 ```
 
+​	所以shouldParkAfterFailedAcquire方法执行完毕，现在的同步队列情况大概就是这样子，即哨兵结点的waitStatus值变为-1。
 
+![queue2](../../assert/queue2.png)
+
+​	上面的执行完毕返回到acquireQueued方法的时候，在acquireQueued方法中就会进行第二次循环了，但是还是获取state失败，而当再次进入shouldParkAfterFailedAcquire方法的时候，当前结点node的前驱结点head的waitStatus已经为-1(SIGNAL)了，就会返回true，然后acquireQueued方法中就会接着执行parkAndCheckInterrupt将自己park阻塞挂起。
+
+```java
+private final boolean parkAndCheckInterrupt() {
+    LockSupport.park(this);
+    return Thread.interrupted();
+}
+```
+
+​	**(5)**我们梳理一下整个方法调用的流程，假设现在又有一个thread3线程竞争这个state，那么这个方法调用的流程是什么样的呢。
+
+​	①首先肯定是调用**ReentrantLock.lock()**方法去尝试加锁;
+
+​	②因为是非公平锁，所以就会转到调用**NoFairSync.lock()**方法;
+
+​	③在NoFairSync.lock()方法中，会首先尝试设置state的值，因为已经被占有那么肯定就是失败的。这时候就会调用AQS的模板方法**AQS.acquire(1)**。
+
+​	④在AQS的模板方法acquire(1)中，实际首先会调用的是子类的tryAcquire()方法，而在非公平锁的实现中即**Sync.nofairTryAcquire()**方法。
+
+​	⑤显然tryAcquire()会返回false，所以acquire()继续执行，即调用**AQS.addWaiter()**，就会将当前线程构造称为一个Node结点,初始状况下waitStatus为0。
+
+​	⑥在addWaiter方法中，会首先尝试直接将构建的node结点以CAS的方式(存在多个线程尝试将自己设置为tail)设置为tail结点，如果设置成功就直接返回，失败的话就会进入一个自旋循环的过程。即调用**enq()**方法。最终保证自己成功被添加到同步队列中。
+
+​	⑦加入同步队列之后，就需要将自己挂起或者嗅探自己的前驱结点是否为头结点以便尝试获取同步状态。即调用**acquireQueued()**方法。
+
+​	⑧在这里thread3的前驱结点不是head结点，所以就直接调用**shouldParkAfterFailedAcquire()**方法，该方法首先会将刚刚的thread2线程结点中的waitStatue的值改变为-1(初始的时候是没有改变这个waitStatus的，每个新节点的添加就会改变前驱结点的waitStatus值)。
+
+​	⑨thread2所在结点的waitStatus改变后，shouldParkAfterFailedAcquire方法会返回false。所以之后还会在acquireQueued中进行第二次循环。并再次调用shouldParkAfterFailedAcquire方法，然后返回true。最终调用**parkAndCheckInterrupt()**将自己挂起。
+
+​	每个线程去竞争这个同步状态失败的话大概就会经历上面的这些过程。假设现在thread3经历上面这些过程之后也进入同步队列，那么整个同步队列大概就是下面这样了.
+
+![queue3](../../assert/queue3.png)
+
+​	将上面的流程整理一下大概就是下面这个图
+
+![exclusive](../../assert/exclusive.png)
+
+#### 非公平锁的释放流程
+
+​	上面说一ReentrantLock为例到了怎样去获得非公平锁，那么thread1获取锁，执行完释放锁的流程是怎样的呢。首先肯定是在finally中调用ReentrantLock.unlock()方法，所以我们就从这个方法开始看起。
+
+​	**(1)**从下面的unlock方法中我们可以看出，实际上是调用AQS的release()方法，其中传递的参数为1，表示每一次调用unlock方法都是释放所获得的一次state。重入的情况下会多次调用unlock方法，也保证了lock和unlock是成对的。
+
+```java
+public void unlock() {
+    sync.release(1); //这里ReentrantLock的unlock方法调用了AQS的release方法
+}
+public final boolean release(int arg) {
+	//这里调用了子类的tryRelease方法，即ReentrantLock的内部类Sync的tryRelease方法
+    if (tryRelease(arg)) {
+        Node h = head;
+        if (h != null && h.waitStatus != 0)
+            unparkSuccessor(h);
+        return true;
+    }
+    return false;
+}
+```
+
+​	**(2)**上面看到release方法首先会调用ReentrantLock的内部类Sync的tryRelease方法。而通过下面代码的分析，大概知道tryRelease做了这些事情。
+
+​	①获取当前AQS的state，并减去1；
+
+​	②判断当前线程是否等于AQS的exclusiveOwnerThread，如果不是，就抛IllegalMonitorStateException异常，这就保证了加锁和释放锁必须是同一个线程；
+
+​	③如果(state-1)的结果不为0，说明锁被重入了，需要多次unlock，这也是lock和unlock成对的原因；
+
+​	④如果(state-1)等于0，我们就将AQS的ExclusiveOwnerThread设置为null；
+
+​	⑤如果上述操作成功了，也就是tryRelase方法返回了true；返回false表示需要多次unlock。
+
+```java
+protected final boolean tryRelease(int releases) {
+    //（1）获取当前的state，然后减1，得到要更新的state
+    int c = getState() - releases;
+    //（2）判断当前调用的线程是不是持有锁的线程，如果不是抛出IllegalMonitorStateException
+    if (Thread.currentThread() != getExclusiveOwnerThread())
+        throw new IllegalMonitorStateException();
+    boolean free = false;
+    //（3）判断更新后的state是不是0
+    if (c == 0) {
+        free = true;
+        //（3-1）将当前锁持者设为null
+        setExclusiveOwnerThread(null);
+    }
+    //（4）设置当前state=c=getState()-releases
+    setState(c);
+    //（5）只有state==0，才会返回true
+    return free;
+}
+```
+
+​	**(3)**那么当tryRelease返回true之后，就会执行release方法中if语句块中的内容。从上面我们看到，
+
+```java
+if (tryRelease(arg)) {
+    //（1）获取当前队列的头节点head
+    Node h = head;
+    //（2）判断头节点不为null，并且头结点的waitStatus不为0(CACCELLED)
+    if (h != null && h.waitStatus != 0)
+        //（3-1）调用下面的方法唤醒同步队列head结点的后继结点中的线程
+        unparkSuccessor(h);
+    return true;
+}
+```
+
+​	**(4)**在获取锁的流程分析中，我们知道当前同步队列如下所示，所以判断得到head!=null并且head的waitStatus=-1。所以会执行unparkSuccessor方法，传递的参数为指向head的一个引用h.那下面我们就看看unparkSuccessor方法中处理了什么事情。
+
+![queue3](../../assert/queue4.png)
+
+```java
+private void unparkSuccessor(Node node) {
+    //（1）获得node的waitStatus
+    int ws = node.waitStatus;
+    //（2）判断waitStatus是否小于0
+    if (ws < 0)
+        //（2-1）如果waitStatus小于0需要将其以CAS的方式设置为0
+        compareAndSetWaitStatus(node, ws, 0);
+
+    //（2）获得s的后继结点，这里即head的后继结点
+    Node s = node.next;
+    //（3）判断后继结点是否已经被移除，或者其waitStatus==CANCELLED
+    if (s == null || s.waitStatus > 0) {
+        //（3-1）如果s！=null，但是其waitStatus=CANCELLED需要将其设置为null
+        s = null;
+        //（3-2）会从尾部结点开始寻找，找到离head最近的不为null并且node.waitStatus的结点
+        for (Node t = tail; t != null && t != node; t = t.prev)
+            if (t.waitStatus <= 0)
+                s = t;
+    }
+    //（4）node.next!=null或者找到的一个离head最近的结点不为null
+    if (s != null)
+        //（4-1）唤醒这个结点中的线程
+        LockSupport.unpark(s.thread);
+}
+```
+
+​	从上面的代码实现中可以总结，unparkSuccessor主要做了两件事情:
+
+​	①获取head节点的waitStatus，如果小于0，就通过CAS操作将head节点的waitStatus修改为0
+
+​	②寻找head节点的下一个节点，如果这个节点的waitStatus小于0，就唤醒这个节点，否则遍历下去，找到第一个waitStatus<=0的节点，并唤醒。
+
+​	**(5)**下面我们应该分析的是释放掉state之后，唤醒同步队列中的结点之后程序又是是怎样执行的。按照上面的同步队列示意图，那么下面会执行这些
+
+​	**①**thread1(获取到锁的线程)调用unlock方法之后，最终执行到unparkSuccessor方法会唤醒thread2结点。**所以thread2被unpark**。
+
+​	**②**再回想一下，当时thread2是在调用acquireQueued方法之后的parkAndCheckInterrupt里面被park阻塞挂起了，所以thread2被唤醒之后**继续执行acquireQueued方法中的for循环**（到这里可以往前回忆看一下acquireQueued方法中的for循环做了哪些事情）；
+
+​	**③**for循环中做的第一件事情就是**查看自己的前驱结点是不是头结点**（按照上面的同步队列情况是满足的）；
+
+​	**④**前驱结点是head结点，就会**调用tryAcquire方法尝试获取state**，因为thread1已经释放了state，即state=0，所以thread2调用tryAcquire方法时候，以**CAS的方式去将state从0更新为1是成功的**，所以这个时候**thread2就获取到了锁**
+
+​	**⑤**thread2获取state成功，就会从acquireQueued方法中退出。注意这时候的acquireQueued返回值为false，所以在AQS的模板方法的acquire中会直接从if条件退出，最后执行自己锁住的代码块中的程序。
 
 ### AQS中的共享模式
+
+​	共享式获取和独占式获取最主要的区别是能否有多个线程同时获取到同步状态。如图所示简易描述二者的区别（共享式访问的时候，可以允许多个线程访问资源，但是存在独占式访问的时候，同一时刻其他的不管是共享还是独占都会被阻塞）
+
+![share1](../../assert/share1.png)
+
+```java
+/**
+ * 此方法是共享模式下线程获取共享同步状态的顶层入口。它会尝试去获取同步状态，获取成功则直接返回，
+ * 获取失败则进入等待队列一直尝试获取(执行doAcquireShared方法体中的内容)，直到获取到资源为止(条件就是tryAcquireShared方法返回值大于等于0)，整个过程忽略中断
+ */
+public final void acquireShared(int arg) {
+    if (tryAcquireShared(arg) < 0)
+        doAcquireShared(arg);
+} 
+/**
+ * "自旋"尝试获取同步状态
+ */
+private void doAcquireShared(int arg) {
+    //首先将该线程包括线程引用、等待状态、前驱结点和后继结点的信息封装台Node中，然后添加到等待队列里面(一共享模式添加)
+    final Node node = addWaiter(Node.SHARED);
+    boolean failed = true;
+    try {
+        boolean interrupted = false; //当前线程的中断标志
+        for (;;) {
+            final Node p = node.predecessor(); //获取前驱结点
+            if (p == head) {
+                //当前驱结点是头结点的时候就会以共享的方式去尝试获取同步状态
+                int r = tryAcquireShared(arg); 
+                //判断tryAcquireShared的返回值
+                if (r >= 0) {
+                    //如果返回值大于等于0，表示获取同步状态成功，就修改当前的头结点并将信息传播都后续的结点队列中
+                    setHeadAndPropagate(node, r);
+                    p.next = null; // 释放掉已经获取到同步状态的前驱结点的资源
+                    if (interrupted)
+                        selfInterrupt(); //检查中断标志
+                    failed = false;
+                    return;
+                }
+            }
+            if (shouldParkAfterFailedAcquire(p, node) &&
+                parkAndCheckInterrupt())
+                interrupted = true;
+        }
+    } finally {
+        if (failed)
+            cancelAcquire(node);
+    }
+}
+```
+
+
+
+**根据源代码我们可以了解共享式获取同步状态的整个过程**
+
+　　首先同步器会调用tryAcquireShared方法来尝试获取同步状态，然后根据这个返回值来判断是否获取到同步状态（当返回值大于等于0可视为获取到同步状态）；如果第一次获取失败的话，就进入'自旋'状态（执行doAcquireShared方法）一直尝试去获取同步状态；在自旋获取中，如果检查到当前前驱结点是头结点的话，就会尝试获取同步状态，而一旦获取成功（tryAcquireShared方法返回值大于等于0）就可以从自旋状态退出。
+
+　　另外，还有一点就是上面说到的一个处于等待队列的线程要想开始尝试去获取同步状态，需要满足的条件就是前驱结点是头结点，那么它本身就是整个队列中的第二个结点。当头结点释放掉所有的临界资源之后，我们考虑每个线程运行所需资源的不同数量问题，如下图所示
+
+![share2](../../assert/share2.png)
 
 ### AQS中的条件变量
 
