@@ -973,32 +973,251 @@ private void unparkSuccessor(Node node) {
 
 ![share1](../../assert/share1.png)
 
+​	我们还是使用ReentrantReadWriteLock中的读锁来简单分析一下AQS提供的共享模式是怎样工作的。在此之前我们先要知道读写锁的一些原理。我们这里只大概说一下读写锁中读写同步状态的表示:
+
+​	**读写锁同步器的同步状态就是读写锁的读写状态，只是读写锁的同步器需要在同步状态上维护多个读线程和写线程的状态。使用按位切割的方式将一个32位整形变量按照高低16位切割成两个部分。对比下图，低位值表示当前获取写锁的线程重入两次，高位的值表示当前获取读锁的线程重入一次。读写锁的获取伴随着读写状态值的更新。当低位为0000_0000_0000_0000的时候表示写锁已经释放，当高位为0000_0000_0000_0000的时候表示读锁已经释放。从下面的划分得到：当state值不等于0的时候，如果写状态(state & 0x0000FFFF)等于0的话，读状态是大于0的，表示读锁被获取；如果写状态不等于0的话，读锁没有被获取。**
+
+![read-write-state](../../assert/read-write-state.png)
+
+#### 读锁的加锁流程
+
+​	**（1）**上面简单说了读写锁中的同步状态的含义，之后还是先从lock方法说起。ReentrantReadWriteLock中的ReadLock中的lock方法如下所示：
+
+```java
+public void lock() {
+    sync.acquireShared(1);
+}
+```
+
+​	**（2）**我们看到，其中还是调用了AQS的模板方法acquireShared方法。所以来看一下acquireShared方法的源码如下所示。
+
 ```java
 /**
- * 此方法是共享模式下线程获取共享同步状态的顶层入口。它会尝试去获取同步状态，获取成功则直接返回，
- * 获取失败则进入等待队列一直尝试获取(执行doAcquireShared方法体中的内容)，直到获取到资源为止(条件就是tryAcquireShared方法返回值大于等于0)，整个过程忽略中断
+ * 	此方法是共享模式下AQS提供的获取共享锁的模板方法。当前线程调用acquireShared方法获取共享资源的
+ * 时候
+ *	(1)它会首先调用tryAcquireShared方法尝试去获取（具体还是设置state的值），
+ *	(2)获取成功则直接返回;
+ *  (3)获取失败则将线程构造称为Node.SHARED类型的结点加入AQS同步队列的尾部.进入等待队列后会调
+ * 用LockSupport.park()挂起自己
  */
 public final void acquireShared(int arg) {
     if (tryAcquireShared(arg) < 0)
         doAcquireShared(arg);
 } 
+```
+
+​	从上面的代码中我们可以看出，实际上跟独占模式相似，AQS首先都会调用子类实现的tryAcquireShared方法来尝试获取同步状态，如果获取成功则直接从acquireShared方法返回，执行自己锁住的同步代码块；否则需要调用doAcquireShared将自己构造称为SHARED模式下获取锁失败的结点(调用的还是addWaiter方法，过程和独占模式差不多)加入同步队列中。
+
+​	**（3）**我们首先先看一下读写锁中Sync类实现的tryAcquireShared方法
+
+```java
+static final int SHARED_SHIFT   = 16;
+//1左移16位减1=>0000_0000_0000_0000_1111_1111_1111_1111
+static final int EXCLUSIVE_MASK = (1 << SHARED_SHIFT) - 1; 
+//返回写状态的值
+static int exclusiveCount(int c) { return c & EXCLUSIVE_MASK; }
+//返回读状态的值
+static int sharedCount(int c)    { return c >>> SHARED_SHIFT; } 
+//记录第一个获取读锁的线程
+private transient Thread firstReader = null;
+//记录第一个获取读锁线程重入的次数
+private transient int firstReaderHoldCount;
+
+protected final int tryAcquireShared(int unused) {
+    //（1）获取当前的同步状态值
+    Thread current = Thread.currentThread();
+    int c = getState();
+    //（2）判断是否被写锁占有，如果被写锁占有会再次判断占有者线程是否是当前想要获取读锁的线程(这里
+    //可能就是锁降级)
+    if (exclusiveCount(c) != 0 &&
+        getExclusiveOwnerThread() != current)
+        return -1;
+    //（3）获取读锁的计数
+    int r = sharedCount(c);
+    //（4）尝试获取锁，多个读线程获取只有一个能获取成功，不成功的后面会调用
+    //fullTryAcquireShared方法进行自旋重试。其中的readerShouldBlock方法表示读锁获取是否需要被阻塞
+    if (!readerShouldBlock() &&
+        r < MAX_COUNT &&
+        compareAndSetState(c, c + SHARED_UNIT)) { // SHARED_UNIT = (1 << 16)
+        //（5）r==0:第一个线程获取读锁
+        if (r == 0) {
+            firstReader = current;
+            firstReaderHoldCount = 1;
+        } else if (firstReader == current) { //（6）如果当前线程是第一个获取读锁的线程(读锁重入)
+            firstReaderHoldCount++;
+        } else {
+            //（7）记录最后一个获取读锁线程的重入次数
+            HoldCounter rh = cachedHoldCounter;
+            if (rh == null || rh.tid != getThreadId(current))
+                cachedHoldCounter = rh = readHolds.get();
+            else if (rh.count == 0)
+                readHolds.set(rh);
+            rh.count++;
+        }
+        return 1;
+    }
+    //（8）这里是readerShouldBlock返回true之后，自旋获取
+    return fullTryAcquireShared(current);
+}
+```
+
+​	从上面的tryAcquireShared方法中，可以总结大概做了这些事情：
+
+​	**①**首先获取AQS中的同步状态state的值，然后查看是否有其他线程占有写锁，如果有则直接返回-1。
+
+​	**②**如果返回-1，AQS会调用doAcquireShared方法将当前线程加入阻塞队列中。
+
+​	**③**如果是当前要获取读锁的线程已经获取了写锁，那么也可以在获取读锁。
+
+​	**④**执行代码（3）得到获取读锁的个数，如果执行到这里说明没有线程获取写锁，但是可能有线程已经获取读锁，所以执行代码（4）。
+
+​	**⑤**其中调用的readerShouldBlock方法在ReentrantReadWriteLock中的NoFairSync实现如下
+
+```java
+final boolean readerShouldBlock() {
+    return apparentlyFirstQueuedIsExclusive();
+}
+final boolean apparentlyFirstQueuedIsExclusive() {
+    Node h, s;
+    //h=head != null:表示头节点不为null
+    //s=h.next != null:表示头节点的后继节点不为null
+    //!s.isShared():表示头结点的后继节点为exclusive的
+    //s.thread!=null表示后继结点中的线程不能为null
+    return (h = head) != null &&
+        (s = h.next)  != null &&
+        !s.isShared()         &&
+        s.thread != null;
+}
+```
+
+​	该方法的含义就是:如果队列中存在一个元素,则判断第一个元素是不是正在尝试获取写锁。如果不是，即(s.isShared())，readerShouldBlock方法会返回false，如果是就会返回true，那么这个获取读锁的线程就该阻塞住。
+
+​	在ReentrantReadWriteLock中的FairSync实现为
+
+```java
+final boolean readerShouldBlock() {
+    return hasQueuedPredecessors();//因为是公平锁，所以如果当前线程构造的结点有前驱结点就得阻塞等待.
+}
+```
+
+​	**⑥**最后在tryAcquireShared方法的代码块（4）中的if中根据readerShouldBlock的返回值确定后续，如果返回false，那么就会紧接着判断获取读锁的线程是不是已经到达最大值。最后执行CAS操作将AQS的state的高16位加1。
+
+​	**⑦**代码块（5）（6）判断当前是不是第一个来获取读锁的线程，如果是就直接计算获取的计数firstReaderHoldCount=1。当然也有可能是该线程再次获取读锁，那么久计算获取的重入数。
+
+​	**⑧**代码块（7）使用cachedHoldCounter记录最后一个获取读锁的线程和该线程获取读锁的可重入数，readHolds记录当前线程获取的读锁重入数。
+
+​	**⑨**代码块（8）的执行意味着readShouldBlock，说明**有线程在获取写锁**或者**自己执行CAS更新读锁状态计数失败**，所以执行fullTryAcquireShared方法。如下所示,主要就是通过**循环**获取state,实现上和tryAcquireShared差不多
+
+```java
 /**
- * "自旋"尝试获取同步状态
+ * 针对readShouldBolck()返回true的两种情况进行分析执行该方法的原因:
+ * 	(1)刚刚我们说了可能是因为 CAS 失败，如果就此返回，那么就要进入到阻塞队列了，
+ * 但是由于之前已经满足了 !readerShouldBlock()，也就是说本来可以不用到阻塞队列的，
+ * 所以进到这个方法其实是增加 CAS 成功的机会
+ * 	(2)在 NonFairSync 情况下，虽然 head.next 是获取写锁的(!(s=head.next).isShared())，但
+ * 是如果我是来重入读锁的，那么也可以执行下面的这个方法重入的获取读锁
  */
+final int fullTryAcquireShared(Thread current) {
+    HoldCounter rh = null;
+    // 自旋的尝试获取读锁
+    for (;;) {
+        int c = getState();
+        // 如果其他线程持有了写锁，还要判断获取写锁的线程是不是就是自己，如果不是自己就肯定返回-1
+        //然后加入阻塞队列了
+        if (exclusiveCount(c) != 0) {
+            if (getExclusiveOwnerThread() != current)
+                return -1;
+            // else we hold the exclusive lock; blocking here
+            // would cause deadlock.
+        } else if (readerShouldBlock()) {
+            /**
+              * 即便readerShouldBlock返回了true，但是如果是一个已经获得读锁的线程想要再次获
+              * 取读锁，肯定不能因为head.next是准备获取写锁的线程就被阻塞住，这样就不能重入了，
+              * 会导致死锁(这也是上面那段因为注释的)：
+              *  1. exclusiveCount(c) == 0：写锁没有被占用，那么获取读锁就可以再次尝试
+              *  2. readerShouldBlock() 为 true，说明阻塞队列中有其他线程在等待(尝试获取写
+              * 锁的线程)
+              */
+            // firstReader第一个获取读锁的线程线程重入读锁，直接到下面的 CAS
+            if (firstReader == current) {
+                // assert firstReaderHoldCount > 0;
+            } else {
+                if (rh == null) {
+                    rh = cachedHoldCounter;
+                    if (rh == null || rh.tid != getThreadId(current)) {
+                        // cachedHoldCounter 缓存的不是当前线程，直接从当前线程的ThreadLocal中获取readHolds
+                        rh = readHolds.get();
+                        // 如果发现 count == 0，也就是说，纯属上一行代码初始化的，那么执行 
+                        //remove,然后往下两三行，乖乖排队去
+                        if (rh.count == 0)
+                            readHolds.remove();
+                    }
+                }
+                if (rh.count == 0)
+                    // 排队去。
+                    return -1;
+            }
+            /**
+              * 这块代码我看了蛮久才把握好它是干嘛的，原来只需要知道，它是处理重入的就可以了。
+              * 就是为了确保读锁重入操作能成功，而不是被塞到阻塞队列中等待
+              *
+              * 另一个信息就是，这里对于 ThreadLocal 变量 readHolds 的处理：
+              *    如果 get() 后发现 count == 0，居然会做 remove() 操作，
+              *    这行代码对于理解其他代码是有帮助的
+              */
+        }
+
+        if (sharedCount(c) == MAX_COUNT)
+            throw new Error("Maximum lock count exceeded");
+
+        if (compareAndSetState(c, c + SHARED_UNIT)) {
+            // 这里 CAS 成功，那么就意味着成功获取读锁了
+            // 下面需要做的是设置 firstReader 或 cachedHoldCounter
+
+            if (sharedCount(c) == 0) {
+                // 如果发现 sharedCount(c) 等于 0，就将当前线程设置为 firstReader
+                firstReader = current;
+                firstReaderHoldCount = 1;
+            } else if (firstReader == current) {
+                firstReaderHoldCount++;
+            } else {
+                // 下面这几行，就是将 cachedHoldCounter 设置为当前线程
+                if (rh == null)
+                    rh = cachedHoldCounter;
+                if (rh == null || rh.tid != getThreadId(current))
+                    rh = readHolds.get();
+                else if (rh.count == 0)
+                    readHolds.set(rh);
+                rh.count++;
+                cachedHoldCounter = rh;
+            }
+            // 返回大于 0 的数，代表获取到了读锁
+            return 1;
+        }
+    }
+}
+```
+
+​	**(4)**最后就是tryAcquireShared方法获取失败,就会将当前线程构建为Node加入同步队列中,然后再尝试获取一次,获取失败就会调用LockSupport.park方法挂起自己。下面是doAcquireShared方法的实现
+
+```java
 private void doAcquireShared(int arg) {
-    //首先将该线程包括线程引用、等待状态、前驱结点和后继结点的信息封装台Node中，然后添加到等待队列里面(一共享模式添加)
+    //(1)首先还是调用add Waiter方法(其中有enq方法，具体和独占模式分析的差不多)将该线程包括线程
+    //引用、等待状态、前驱结点和后继结点的信息封装台Node中，然后添加到等待队列里面(共享模式添加)
     final Node node = addWaiter(Node.SHARED);
     boolean failed = true;
     try {
         boolean interrupted = false; //当前线程的中断标志
         for (;;) {
-            final Node p = node.predecessor(); //获取前驱结点
+            //(2)获取前驱结点
+            final Node p = node.predecessor();
             if (p == head) {
-                //当前驱结点是头结点的时候就会以共享的方式去尝试获取同步状态
+                //(2-1)当前驱结点是头结点的时候就会以共享的方式去尝试获取同步状态
                 int r = tryAcquireShared(arg); 
-                //判断tryAcquireShared的返回值
+                //(2-2)判断tryAcquireShared的返回值
                 if (r >= 0) {
-                    //如果返回值大于等于0，表示获取同步状态成功，就修改当前的头结点并将信息传播都后续的结点队列中
+                    //如果返回值大于等于0，表示获取同步状态成功，就修改当前的头结点并将信息传播
+                    //都后续的结点队列中
                     setHeadAndPropagate(node, r);
                     p.next = null; // 释放掉已经获取到同步状态的前驱结点的资源
                     if (interrupted)
@@ -1007,6 +1226,8 @@ private void doAcquireShared(int arg) {
                     return;
                 }
             }
+            //(3)这里和上面的独占模式调用的方法相同，大概做的就是将自己的前驱结点的waitStatus
+            //设置为-1，然后返回。之后调用parkAndCheckInterrupt挂起自己
             if (shouldParkAfterFailedAcquire(p, node) &&
                 parkAndCheckInterrupt())
                 interrupted = true;
@@ -1018,15 +1239,21 @@ private void doAcquireShared(int arg) {
 }
 ```
 
+​	看完我们可以简单总结一下doAcquireShared做的核心事情：
 
+​	①将获取state失败的线程以SHARED的mode(模式)调用addWaiter方法确保加入同步队列的尾部；
+
+​	②获取前驱结点，并判断前驱结点是否是头节点。如果是头节点，将调用tryAcquireShared方法尝试获取同步状态，如果返回值大于0表示获取成功(因为是共享式同步状态，所以需要将这个获取成功的消息传递给这个共享是同步队列的后续结点)。如果获取失败，则调用LockSupport.park挂起自己
 
 **根据源代码我们可以了解共享式获取同步状态的整个过程**
 
-　　首先同步器会调用tryAcquireShared方法来尝试获取同步状态，然后根据这个返回值来判断是否获取到同步状态（当返回值大于等于0可视为获取到同步状态）；如果第一次获取失败的话，就进入'自旋'状态（执行doAcquireShared方法）一直尝试去获取同步状态；在自旋获取中，如果检查到当前前驱结点是头结点的话，就会尝试获取同步状态，而一旦获取成功（tryAcquireShared方法返回值大于等于0）就可以从自旋状态退出。
+　　首先同步器会调用tryAcquireShared方法来尝试获取同步状态，然后根据这个返回值来判断是否获取到同步状态（当返回值大于等于0可视为获取到同步状态）；如果第一次获取失败的话，就进入'**自旋**'状态（执行doAcquireShared方法）一直尝试去获取同步状态；在自旋获取中，如果检查到当前前驱结点是头结点的话，就会尝试获取同步状态，而一旦获取成功（tryAcquireShared方法返回值大于等于0）就可以从自旋状态退出。
 
-　　另外，还有一点就是上面说到的一个处于等待队列的线程要想开始尝试去获取同步状态，需要满足的条件就是前驱结点是头结点，那么它本身就是整个队列中的第二个结点。当头结点释放掉所有的临界资源之后，我们考虑每个线程运行所需资源的不同数量问题，如下图所示
+　　另外，还有一点就是上面说到的一个处于等待队列的线程要想开始尝试去获取同步状态，需要满足的条件就是前驱结点是头结点，那么它本身就是整个队列中的第二个结点。当释放掉所有的临界资源之后，我们考虑每个线程运行所需资源的不同数量问题，如下图所示
 
 ![share2](../../assert/share2.png)
+
+#### 读锁的释放流程
 
 ### AQS中的条件变量
 
