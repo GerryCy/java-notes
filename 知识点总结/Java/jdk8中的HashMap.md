@@ -1,3 +1,17 @@
+[HashMap中的存储结构图示](#HashMap中的存储结构图示)
+
+[HashMap中的成员变量以及含义](#HashMap中的成员变量以及含义)
+
+[HashMap构造方法](#HashMap构造方法)
+
+[怎样确定元素在桶中的位置](#怎样确定元素在桶中的位置)
+
+[put方法分析](#put方法分析)
+
+[resize方法分析](#resize方法分析)
+
+[get方法分析](#get方法分析)
+
 # HashMap jdk1.8版本
 
 ## HashMap中的存储结构图示
