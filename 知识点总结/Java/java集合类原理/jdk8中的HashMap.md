@@ -18,7 +18,7 @@
 
 ​	因为主要说的是1.8版本中的实现。而1.8中HashMap是数组+链表+红黑树实现的，大概如下图所示。后面还是主要介绍Hash Map中主要的一些成员以及方法原理。
 
-![](../../assert/hash4.png)
+![](../../../assert/hash4.png)
 
 ​	那么上述图示中的结点Node具体类型是什么，源码如下。Node是HashMap的内部类，实现了Map.Entery接口，主要就是存放我们put方法所添加的元素。其中的next就表示这可以构成一个单向链表，这主要是通过链地址法解决发生hash冲突问题。而当桶中的元素个数超过阈值的时候就换转为红黑树。
 
@@ -147,7 +147,7 @@ static final int hash(Object key) {
 
 ​	假设现在我们向一个map中添加元素，例如map.put("fsmly","test")，那么其中key为"fsmly"的hashCode的二进制表示为**0000_0000_0011_0110_0100_0100_1001_0010**，按照上面的步骤来计算，那么我们调用hash算法得到的hash值为：‭
 
-![hash](../../assert/hash2.png)
+![hash](../../../assert/hash2.png)
 
 ### (2)tableSizeFor方法说明
 
@@ -268,7 +268,7 @@ p = tab[i = (n - 1) & hash];
 
 ​	下面我们通过一个例子计算一下上面这个定位的过程，假设现在桶大小n为16.
 
-![hash](../../assert/hash.png)
+![hash](../../../assert/hash.png)
 
 ​	我们可以看到，这里的hash方法并不是用原有对象的hashcode最为最终的hash值，而是做了一定位运算，大概因为如果(n-1)的值太小的话，(n - 1) & hash的值就完全依靠hash的低位值，比如n-1为0000 1111，那么最终的值就完全依赖于hash值的低4位了，这样的话hash的高位就玩完全失去了作用，h ^ (h >>> 16)，通过这种方式，让高位数据与低位数据进行异或，也是变相的加大了hash的随机性，这样就不单纯的依赖对象的hashcode方法了。
 
@@ -489,19 +489,19 @@ final Node<K,V>[] resize() {
 
 （1）若判断条件为真，意味着**oldCap为1的那位对应的hash位为0**(1&0=0,其他位都是0,结果自然是0)，对新索引的计算没有影响，至于为啥没影响下面就说到了。先举个例子计算一下数组中的下标在扩容前后的变化：
 
-![](../../assert/resize1.png)
+![](../../../assert/resize1.png)
 
 ​	从上面计算发现，当cap为1的那位对应的hash为0的时候，resize前后的index是不变的。我们再看下面，使用上面的hash值，对应的就是 **(e.hash & oldCap) == 0**，恰好也是下标不变的
 
-![](../../assert/resize3.png)
+![](../../../assert/resize3.png)
 
 ​	（2）若判断条件为假，则 **oldCap为1的那位对应的hash位为1**。比如新下标=hash&( newCap-1 )= hash&( (16<<2) - 1)=10010，相当于多了10000，即 oldCap .如同下面的例子
 
-![](../../assert/resize2.png)
+![](../../../assert/resize2.png)
 
 ​	从上面计算发现，当cap为1的那位对应的hash为1的时候，resize前后的index是改变的。我们再看下面，使用上面的hash值，对应的就是 **(e.hash & oldCap) != 0**，恰好下标就是原索引+原容量
 
-![](../../assert/resize4.png)
+![](../../../assert/resize4.png)
 
 ### (3)部分代码理解
 
@@ -533,7 +533,7 @@ else {
 
 ​	我们直接通过一个简单的图来理解吧
 
-![](../../assert/resize5.png)
+![](../../../assert/resize5.png)
 
 ### (4)resize总结
 
@@ -546,7 +546,7 @@ else {
   - 如果为链表，根据hash算法进行重新计算下标，将链表进行拆分分组（相信看到这里基本上也知道链表拆分的大致过程了）
   - 附上网上的一张resize扩容的图。博客链接https://blog.csdn.net/carson_ho/article/details/79373134
 
-![](../../assert/resize6.png)
+![](../../../assert/resize6.png)
 
 ## get方法分析
 
